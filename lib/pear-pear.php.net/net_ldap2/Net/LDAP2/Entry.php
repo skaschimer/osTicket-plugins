@@ -151,7 +151,7 @@ class Net_LDAP2_Entry extends PEAR
         parent::__construct('Net_LDAP2_Error');
 
         // set up entry resource or DN
-        if ($entry !== false) {
+        if (is_resource($entry) || $entry instanceof \LDAP\ResultEntry) {
             $this->_entry = $entry;
         } else {
             $this->_dn = $entry;
@@ -161,7 +161,7 @@ class Net_LDAP2_Entry extends PEAR
         if ($ldap instanceof Net_LDAP2) {
             $this->_ldap = $ldap;
             $this->_link = $ldap->getLink();
-        } elseif ($ldap !== false) {
+        } elseif (is_resource($ldap) || $ldap instanceof \LDAP\Connection) {
             $this->_link = $ldap;
         } elseif (is_array($ldap)) {
             // Special case: here $ldap is an array of attributes,
@@ -173,7 +173,9 @@ class Net_LDAP2_Entry extends PEAR
 
         // if this is an entry existing in the directory,
         // then set up as old and fetch attrs
-        if (($this->_entry !== false) && ($this->_link !== false)) {
+        if ((is_resource($this->_entry) || $this->_entry instanceof \LDAP\ResultEntry)
+            && (is_resource($this->_link) || $this->_link instanceof \LDAP\Connection)
+        ) {
             $this->_new = false;
             $this->_dn  = @ldap_get_dn($this->_link, $this->_entry);
             $this->setAttributes();  // fetch attributes from server
@@ -235,7 +237,7 @@ class Net_LDAP2_Entry extends PEAR
         if (!$ldap instanceof Net_LDAP2) {
             return PEAR::raiseError("Unable to create connected entry: Parameter \$ldap needs to be a Net_LDAP2 object!");
         }
-        if ($entry == false) {
+        if (!is_resource($entry) && !$entry instanceof \LDAP\ResultEntry) {
             return PEAR::raiseError("Unable to create connected entry: Parameter \$entry needs to be a ldap entry resource!");
         }
 
@@ -354,7 +356,10 @@ class Net_LDAP2_Entry extends PEAR
         /*
         * fetch attributes from the server
         */
-        if (is_null($attributes) && ($this->_entry !== false) && ($this->_link !== false)) {
+        if (is_null($attributes)
+            && (is_resource($this->_entry) || $this->_entry instanceof \LDAP\ResultEntry)
+            && (is_resource($this->_link) || $this->_link instanceof \LDAP\Connection)
+        ) {
             // fetch schema
             if ($this->_ldap instanceof Net_LDAP2) {
                 $schema = $this->_ldap->schema();
@@ -489,7 +494,7 @@ class Net_LDAP2_Entry extends PEAR
                         $value = array_shift($value);
                     }
             }
-            
+
         }
 
         return $value;
@@ -744,13 +749,14 @@ class Net_LDAP2_Entry extends PEAR
     * Remove the entry from the server and readd it as new in such cases.
     * This also will deal with problems with setting structural object classes.
     *
-    * @param Net_LDAP2 $ldap If passed, a call to setLDAP() is issued prior update, thus switching the LDAP-server. This is for perl-ldap interface compliance
+    * @param Net_LDAP2  $ldap If passed, a call to setLDAP() is issued prior update, thus switching the LDAP-server. This is for perl-ldap interface compliance
+    * @param boolean    $deleteoldrdn (optional) if false the old RDN value(s) is retained as non-distinguishided values of the entry.
     *
     * @access public
     * @return true|Net_LDAP2_Error
     * @todo Entry rename with a DN containing special characters needs testing!
     */
-    public function update($ldap = null)
+    public function update($deleteoldrdn = true, $ldap = null)
     {
         if ($ldap) {
             $msg = $this->setLDAP($ldap);
@@ -767,7 +773,7 @@ class Net_LDAP2_Entry extends PEAR
 
         // Get and check link
         $link = $ldap->getLink();
-        if ($link == false) {
+        if (!is_resource($link) && !$link instanceof \LDAP\Connection) {
             return PEAR::raiseError("Could not update entry: internal LDAP link is invalid");
         }
 
@@ -825,7 +831,7 @@ class Net_LDAP2_Entry extends PEAR
             $parent = Net_LDAP2_Util::canonical_dn($parent);
 
             // rename/move
-            if (false == @ldap_rename($link, $this->_dn, $child, $parent, false)) {
+            if (false == @ldap_rename($link, $this->_dn, $child, $parent, $deleteoldrdn)) {
 
                 return PEAR::raiseError("Entry not renamed: " .
                                         @ldap_error($link), @ldap_errno($link));
@@ -850,8 +856,8 @@ class Net_LDAP2_Entry extends PEAR
             if ($fullEntry->exists($attr)) {
                 $currentValue = $fullEntry->getValue($attr, "all");
                 $value = array_merge( $currentValue, $value );
-            } 
-            
+            }
+
             $modifications[$attr] = $value;
         }
 
@@ -864,7 +870,7 @@ class Net_LDAP2_Entry extends PEAR
             if (!is_array($value)) {
                 $value = array($value);
             }
-            
+
             // Find out what is missing from $value and exclude it
             $currentValue = isset($modifications[$attr]) ? $modifications[$attr] : $fullEntry->getValue($attr, "all");
             $modifications[$attr] = array_values( array_diff( $currentValue, $value ) );

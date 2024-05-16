@@ -433,7 +433,7 @@ class StaffLDAPAuthentication extends StaffAuthenticationBackend
     function getName() {
         $config = $this->config;
         list($__, $_N) = $config->translate();
-        return $__(static::$name);
+        return $config->getName() ?: $__(static::$name);
     }
 
     function lookup($dn) {
@@ -472,7 +472,7 @@ class ClientLDAPAuthentication extends UserAuthenticationBackend {
     function getName() {
         $config = $this->config;
         list($__, $_N) = $config->translate();
-        return $__(static::$name);
+        return $config->getName() ?: $__(static::$name);
     }
 
     function authenticate($username, $password=false, $errors=array()) {

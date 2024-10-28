@@ -33,9 +33,9 @@ class OAuth2Config extends PluginConfig {
         return $this->get('clientSecret');
     }
 
-    public function getScopes() {
-        return array_map('trim',
-                explode(',', $this->get('scopes', [])));
+    public function getScopes($key='scopes') {
+        return array_filter(array_map('trim',
+                explode(',', $this->get($key, []))));
     }
 
     public function getAuthorizationUrl() {
@@ -360,7 +360,7 @@ class OAuth2EmailConfig extends OAuth2Config {
     }
 
     // This is necessay so the parent can reject updates on Autho instances via plugins
-    // intervace which is doesn't have re-authorization capabilities at the
+    // interface which doesn't have re-authorization capabilities at the
     // moment.
     function pre_save(&$config, &$errors) {
         return true;
@@ -371,5 +371,28 @@ class OAuth2EmailConfig extends OAuth2Config {
         return array_diff_key(parent::getFields(),
                 array_flip(['idp', 'auth_type'])
                 );
+    }
+}
+
+class OAuth2MicrosoftEmailConfig extends OAuth2EmailConfig {
+
+    function getFields() {
+        list($__, $_N) = self::translate();
+        $fields = parent::getFields();
+        // Add Outlook Mail Scopes field after access token endpoint
+        $pos = array_search('urlAccessToken', array_keys($fields), true) + 1;
+        return array_slice($fields, 0, $pos, true) + [
+            // Outlook Mail Scopes without resource scopes
+            'scopes' => new TextboxField([
+                    'label' => $__('Outlook Scopes'),
+                    'hint' => $__('Space separated Outlook Scopes for desired services'),
+                    'required' => true, // Required!
+                    'configuration' => [
+                        'size' => 64,
+                        'length' => 0
+                    ],
+                ]
+            ),
+        ];
     }
 }

@@ -834,6 +834,22 @@ class MicrosoftEmailOauth2Provider extends GenericEmailOauth2Provider {
         'prompt' => 'select_account',
         ];
 
+    /*
+     * TEMP: To avoid breaking changes, we're intercepting
+     * addPluginInstance to populate urlResourceOwnerDetails which is
+     * removed from this nameless provider's Config form for reasons
+     * mentioned below.
+     * TODO: Update addPluginInstance in class.plugin.php to take
+     * instanciated form instead of $vars. This will allow provider to
+     * validate it's own data.
+     */
+    function addPluginInstance($vars, &$errors) {
+        // We nolonger need resource owner url but core uses default config
+        // form - so we have to add it here.
+        $vars['urlResourceOwnerDetails'] = self::$defaults['urlResourceOwnerDetails'];
+        return parent::addPluginInstance($vars,$errors);
+    }
+
     // Nuke ability to get resource owner details - see below
     function getResourceOwnerUrl() {
         return null;

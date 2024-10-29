@@ -284,7 +284,7 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
                 elseif (!$this->signIn($info) && $this->isStrict())
                     // TODO: Move Strict checking to osTiket core after v1.18.2
                     $errors[$err] = $this->error_msg(self::ERR_EMAIL_MISMATCH, $info);
-                elseif (isset($info['resource_owner_email']))
+                elseif (!isset($info['resource_owner_email']))
                     $info['resource_owner_email'] =  $this->getEmailAddress();
                 // Update the credentials if no validation errors
                 if (!$errors

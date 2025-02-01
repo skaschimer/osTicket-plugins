@@ -19,7 +19,9 @@
 **********************************************************************/
 include_once 'auth.php';
 
-use League\OAuth2\Client\Provider\GenericProvider;
+use League\OAuth2\Client\Provider\GenericProvider as GenericClient;
+use League\OAuth2\Client\Token\AccessToken;
+use League\OAuth2\Client\Grant\AbstractGrant;
 
 /**
  * OAuth2AuthBackend
@@ -49,7 +51,6 @@ interface OAuth2AuthBackend {
     function setState($state);
     function getState();
     function resetState();
-    function getAccessToken($code);
 }
 
 /**
@@ -69,8 +70,6 @@ trait OAuth2AuthenticationTrait {
     private $session;
     // Configuration store
     protected $config;
-    // Supported attributes mapped to scopes - hard coded for now
-    private $attributes = ['username', 'givenname', 'surname', 'email'];
 
     function __construct($config, $provider=null) {
         $this->config = $config;
@@ -80,17 +79,16 @@ trait OAuth2AuthenticationTrait {
             $this->provider = $provider;
         else
             $this->provider = new GenericOauth2Provider();
-
-        // Get Oauth Client based on provider
-        $this->client = $this->provider->getClient($config);
+        // Pass effective config to the provider
+        $this->provider->setConfig($config);
     }
 
     function callback($resp, $ref=null) {
+        //TODO: Log any errors to system logs
         try {
             if ($this->getState() == $resp['state']
-                    && ($token=$this->getAccessToken($resp['code']))
-                    && ($owner=$this->client->getResourceOwner($token))
-                    && ($attrs=$this->mapAttributes($owner->toArray()))) {
+                && ($token=$this->provider->getToken($resp['code']))
+                && ($attrs=$token->getOwnerAttributes())) {
                 $this->resetState();
                 // Attempt to signIn the user based on returned attributes
                 $result = $this->signIn($attrs);
@@ -130,42 +128,12 @@ trait OAuth2AuthenticationTrait {
         return  $this->session['AuthState'];
     }
 
-    private function mapAttributes(array $result) {
-        // Mapout the supported attributes only
-        $attributes = array();
-        $result = array_change_key_case($result, CASE_LOWER);
-        foreach ($this->attributes as $attr) {
-            if (!($key=strtolower($this->config->getAttributeFor($attr))))
-                continue;
-            $attributes[$attr] = $result[$key] ?: null;
-        }
-        // Use email as username if none is provided or vice versa!
-        if (!isset($attributes['username']) && isset($attributes['email']))
-            $attributes['username'] = $attributes['email'];
-        elseif (!isset($attributes['email'])
-                && isset($attributes['username'])
-                && Validator::is_email($attributes['username']))
-            $attributes['email'] = $attributes['username'];
-
-        return $attributes;
-    }
-
-    public function getAccessToken($code) {
-        return $this->client->getAccessToken('authorization_code',
-                ['code' => $code]);
-    }
-
-    public function refreshAccessToken($refreshToken) {
-        return $this->client->getAccessToken('refresh_token',
-                ['refresh_token' => $refreshToken]);
-    }
-
     public function triggerAuth() {
         parent::triggerAuth();
-        // Regenerate OAuth2 auth request
-        $authUrl = $this->client->getAuthorizationUrl();
+        // Getting auth url sets the state required below
+        $authUrl = $this->provider->getAuthorizationUrl();
         // Get the state generated for you and store it to the session.
-        $this->setState($this->client->getState());
+        $this->setState($this->provider->getState());
         $this->redirectTo($authUrl);
     }
 
@@ -271,7 +239,7 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
     const ERR_REFRESH_TOKEN = 3;
 
     private function isStrict() {
-        // TODO: Require osTicket v1.18 and delegate strict checking to
+        // TODO: Require osTicket v1.18.2 and delegate strict checking to
         // the email account ($this->account->isStrict())
         // For now the flag is being set via the provider by overloading
         // backend id
@@ -290,6 +258,10 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
         return $this->account->email->getEmail();
     }
 
+    public function refreshAccessToken($refreshToken, $scopes=null) {
+        return $this->provider->refreshToken($refreshToken, $scopes);
+    }
+
     private function updateCredentials($info, &$errors) {
         return $this->account->updateCredentials(
                 $this->provider->getId(), $info, $errors);
@@ -300,33 +272,28 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
         $err = sprintf('%s_auth_bk', $this->account->getType());
         try {
             if ($this->getState() == $resp['state']
-                    && ($token=$this->getAccessToken($resp['code']))
-                    && ($owner=$this->client->getResourceOwner($token))
-                    && ($attrs=$this->mapAttributes($owner->toArray()))) {
+                // Provider returns custom AccessToken
+                && ($token=$this->provider->getToken($resp['code']))) {
+                // Reset state
                 $this->resetState();
-                $info =  [
-                    'access_token' => $token->getToken(),
-                    'refresh_token' => $token->getRefreshToken(),
-                    'expires' => $token->getExpires(),
-                    'resource_owner_id' => $token->getResourceOwnerId(),
-                    'resource_owner_email' => $attrs['email'],
-                ];
-
-                if (!isset($attrs['email']))
-                    $errors[$err] = $this->error_msg(self::ERR_EMAIL_ATTR, $attrs);
-                elseif (!$info['refresh_token'])
+                $info = $token->jsonSerialize();
+                // Do basic checks
+                if (!isset($info['refresh_token']))
+                    // Make sure we have refresh token
                     $errors[$err] = $this->error_msg(self::ERR_REFRESH_TOKEN);
-                elseif (!$this->signIn($attrs) && $this->isStrict()) {
-                    // On strict mode email mismatch is an error
-                    // TODO: Move Strict checking to osTiket core on
-                    // credentials update.
-                    $errors[$err] = $this->error_msg(self::ERR_EMAIL_MISMATCH, $attrs);
-                }
+                elseif (!$this->signIn($info) && $this->isStrict())
+                    // TODO: Move Strict checking to osTiket core after v1.18.2
+                    $errors[$err] = $this->error_msg(self::ERR_EMAIL_MISMATCH, $info);
+                elseif (!isset($info['resource_owner_email']))
+                    $info['resource_owner_email'] =  $this->getEmailAddress();
                 // Update the credentials if no validation errors
                 if (!$errors
-                        && !$this->updateCredentials($info, $errors)
-                        && !isset($errors[$err]))
-                     $errors[$err] = $this->error_msg(self::ERR_UNKNOWN);
+                    && !$this->updateCredentials($info, $errors)
+                    && !isset($errors[$err]))
+                    $errors[$err] = $this->error_msg(self::ERR_UNKNOWN);
+            } else {
+                //TODO: Figure out what the hell happened
+                $errors[$err] = $this->error_msg(self::ERR_UNKNOWN);
             }
         } catch (Exception $ex) {
             $errors[$err] =  $ex->getMessage();
@@ -341,22 +308,21 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
             $email->stash('notice', sprintf('%s: %s',
                         $this->account->getType(),
                         __('OAuth2 Authorization Successful')
-                        ));
+            ));
         // redirect back to email page
         $this->onSignIn();
     }
 
     public function triggerAuth() {
-        // Regenerate OAuth2 auth request
-        $urlOptions = $this->provider->getUrlOptions() ?: [];
-        $authUrl = $this->client->getAuthorizationUrl($urlOptions);
+        // We have to get the Auth Url first before setting state
+        $authUrl = $this->provider->getAuthorizationUrl();
         // Get the state generated for you and store it to the session.
-        $this->setState($this->client->getState());
+        $this->setState($this->provider->getState());
         $this->redirectTo($authUrl);
     }
 
-    private function signIn($attrs) {
-        return !strcasecmp($attrs['email'], $this->getEmailAddress());
+    private function signIn($info) {
+        return !strcasecmp($info['resource_owner_email'], $this->getEmailAddress());
     }
 
     private function onSignIn() {
@@ -373,9 +339,9 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
                 return __('Invalid Email Atrribute');
                 break;
             case self::ERR_EMAIL_MISMATCH:
-                return sprintf(__('Email Mismatch: Expecting Authorization for %s not %s'),
+                return sprintf(__('Strict Mode: Expecting Authorization for %s not %s'),
                         $this->getEmailAddress(),
-                        $attrs['email']);
+                        $attrs['resource_owner_email']);
                 break;
             case self::ERR_REFRESH_TOKEN:
                 return __('Unable to obtain Refresh Token');
@@ -389,9 +355,12 @@ class OAuth2EmailAuthBackend implements OAuth2AuthBackend  {
 
 abstract class OAuth2ProviderBackend extends OAuth2AuthorizationBackend {
     protected $config;
+    private $client;
     private $plugin;
     private $plugin_id;
     static $defaults = [];
+    // Supported attributes mapped to scopes - hard coded for now
+    private static $attributes = ['username', 'givenname', 'surname', 'email'];
 
     // Strict flag
     private $strict = false;
@@ -399,6 +368,10 @@ abstract class OAuth2ProviderBackend extends OAuth2AuthorizationBackend {
     function __construct($options=[]) {
         if (isset($options['plugin_id']))
             $this->plugin_id = (int) $options['plugin_id'];
+    }
+
+    function getSupportedAttributes() {
+        return self::$attributes;
     }
 
     function isStrict() {
@@ -424,15 +397,78 @@ abstract class OAuth2ProviderBackend extends OAuth2AuthorizationBackend {
         return $this->plugin;
     }
 
+    public function getResourceOwner(Token $token) {
+        return $this->getClient()->getResourceOwner($token);
+    }
+
+    // Providers that don't support getting resource owner details can
+    // override this function and return null | false to skip the step of
+    // getting the resource owner details. We will attempt to get the info
+    // anyhow by decoding the access token.
+    function getResourceOwnerUrl() {
+        return $this->config->get('urlResourceOwnerDetails', null);
+    }
+
+    // Get Access Token and set resource owner (if any)
+    public function getToken($code, $getResourceOwner = true) {
+        $token = $this->getClient()->getToken($code);
+        // If we have Resource Url then assume we can get the resource Owner
+        if ($getResourceOwner
+            && $this->getResourceOwnerUrl()
+            && ($owner=$this->getResourceOwner($token))
+            // We're looking for specific attribute based on config
+            && ($attrs=$this->mapAttributes($owner->toArray()))) {
+            // Set the owner object with attributes + id (if any)
+            $token->setOwner((Object) array_merge(
+                $owner->toArray(), $attrs, ['id' => $owner->getId()]));
+        }
+        return $token;
+    }
+
+    // Refresh Access Token
+    public function refreshToken($refreshToken, $scopes=null) {
+        return $this->getClient()->refreshToken($refreshToken, $scopes);
+    }
+
+    function getUrlOptions() {
+        return [];
+    }
+
+    function getState() {
+        return $this->getClient()->getState();
+    }
+
+    function getAuthorizationUrl() {
+        // Regenerate OAuth2 auth request
+        $urlOptions = $this->getUrlOptions() ?: [];
+        return $this->getClient()->getAuthorizationUrl($urlOptions);
+    }
+
+    function getClient() {
+        if (!isset($this->client))
+            $this->client = $this->newOAuth2Client();
+
+        return $this->client;
+    }
+
+    protected function newOAuth2Client($params=[]) {
+        // Params are merged last and can override config settings
+        return new OAuth2Client(array_merge($this->getConfig()->getClientSettings(), $params));
+    }
+
+    function setConfig(PluginConfig $config) {
+        $this->config = $config;
+    }
+
     function getConfig($instance=null, $vars=[]) {
         if  ($instance && !is_object($instance))
             $instance = $this->getPluginInstance($instance);
         if (!isset($this->config) || $instance) {
-            $this->config = new OAuth2EmailConfig($instance ?
+            $class = $this->getConfigClass();
+            $this->config = new $class($instance ?
                     $instance->getNamespace() : null, $vars);
             $this->config->setInstance($instance);
         }
-
         return $this->config;
     }
 
@@ -483,14 +519,35 @@ abstract class OAuth2ProviderBackend extends OAuth2AuthorizationBackend {
         try {
             $token = $bk->refreshAccessToken($refreshToken);
             return array_filter([
-		'access_token' => $token->getToken(),
-		'refresh_token' => $token->getRefreshToken(),
-		'expires' => $token->getExpires()
-	    ]);
+                'access_token' => $token->getAccessToken(),
+                'refresh_token' => $token->getRefreshToken(),
+                'expires' => $token->getExpires()
+            ]);
         } catch( Exception $ex) {
             $errors['refresh_token'] = $ex->getMessage();
         }
     }
+
+    protected function mapAttributes(array $result) {
+        // Mapout the supported attributes only
+        $attributes = array();
+        $result = array_change_key_case($result, CASE_LOWER);
+        foreach ($this->getSupportedAttributes() as $attr) {
+            if (!($key=strtolower($this->config->getAttributeFor($attr))))
+                continue;
+            $attributes[$attr] = $result[$key] ?: null;
+        }
+        // Use email as username if none is provided or vice versa!
+        if (!isset($attributes['username']) && isset($attributes['email']))
+            $attributes['username'] = $attributes['email'];
+        elseif (!isset($attributes['email'])
+                && isset($attributes['username'])
+                && Validator::is_email($attributes['username']))
+            $attributes['email'] = $attributes['username'];
+
+        return $attributes;
+    }
+
 
     function triggerEmailAuth($id) {
         if (!($bk=$this->getEmailAuthBackend($id)))
@@ -534,11 +591,10 @@ abstract class OAuth2ProviderBackend extends OAuth2AuthorizationBackend {
         self::registerEmailAuthoProviders($options);
         self::registerAuthenticationProviders($options);
     }
-
-    abstract function getClient(PluginConfig $config);
 }
 
-class OAuth2Client extends GenericProvider {
+class OAuth2Client extends GenericClient {
+
     protected function getAuthorizationParameters(array $options) {
         // Cleanup prompt conflicts
         // approval_prompt, hardcoded upstream, nolonger works for Google
@@ -549,31 +605,119 @@ class OAuth2Client extends GenericProvider {
 
         return $options;
     }
+
+    // We're going to create our own token which extends AccessToken
+    private function createToken(array $response) {
+        return new Token($response);
+    }
+
+    // Extend Token create
+    protected function createAccessToken(array $response, AbstractGrant $grant) {
+        return $this->createToken($response);
+    }
+
+    public function getToken($code) {
+        return $this->getAccessToken('authorization_code',
+                ['code' => $code]);
+    }
+
+    public function refreshToken($refreshToken, $scopes=null) {
+        return $this->getAccessToken('refresh_token',
+                array_filter(['refresh_token' => $refreshToken, 'scope' => $scopes]));
+    }
 }
 
+// We Are extending AccessToken here so we can decode jwt attributes
+class Token extends AccessToken {
+    // Decoded token object
+    private $jwt;
+    private $owner;
+
+    // Simple token decoder
+    public function getJwt() {
+        // Decode Access Token and return an array object of it's
+        // jwt attributes.
+        if (!isset($this->jwt))
+            $this->jwt = json_decode(base64_decode(str_replace('_', '/',
+                str_replace('-','+',explode('.', $this->getToken())[1]))));
+
+        return $this->jwt;
+    }
+
+    protected function getUpn() {
+        return $this->getJwt()->upn;
+    }
+
+    protected function getUniqueName() {
+        return $this->getJwt()->unique_name;
+    }
+
+    public function setOwner(Object $owner) {
+        $this->owner = $owner;
+    }
+
+    public function getOwner() {
+        if (!isset($this->owner)) {
+            $this->owner = (object) [
+                'id' =>  $this->getJwt()->oid,
+                'email' => $this->getUniqueName() ?: $this->getUpn(),
+                'username' => $this->getUniqueName() ?: $this->getUpn(),
+            ];
+        }
+        return $this->owner;
+    }
+
+    private function getOwnerAsArray() {
+        return json_decode((string) json_encode($this->getOwner()), true);
+    }
+
+    public function getOwnerAttributes() {
+        return $this->getOwnerAsArray();
+    }
+
+    public function getOwnerId() {
+        return $this->getOwner()->id;
+    }
+
+    public function getOwnerEmail() {
+         return $this->getOwner()->email;
+    }
+
+    public function getAccessToken() {
+        return $this->getToken();
+    }
+
+    public function jsonSerialize() {
+        // Info we need to store the token locally
+        return array_merge(parent::jsonSerialize(), [
+            'resource_owner_id' => $this->getOwnerId(),
+            'resource_owner_email' => $this->getOwnerEmail()
+        ]);
+    }
+}
 
 class GenericOauth2Provider extends OAuth2ProviderBackend {
+    protected $config;
     static $id = 'oauth2:other';
     static $name = 'OAuth2 - Other';
+    static $config_class = 'OAuth2EmailConfig';
     static $defaults = [];
     static $urlOptions = [];
 
+    function getConfigClass() {
+        return static::$config_class;
+    }
 
     function getUrlOptions() {
         return static::$urlOptions;
     }
 
-    function getClient(PluginConfig $config) {
-        return new OAuth2Client($config->getClientSettings());
-    }
 }
 
 class OtherOauth2Provider extends GenericOauth2Provider {
     static $id = 'oauth2:other';
     static $name = 'OAuth2 - Other';
     static $icon = 'icon-plus-sign';
-    static $defaults = [];
-    static $urlOptions = [];
 
 }
 
@@ -585,7 +729,7 @@ class GoogleOauth2Provider extends GenericOauth2Provider {
     static $defaults = [
         'urlAuthorize'   => 'https://accounts.google.com/o/oauth2/v2/auth',
         'urlAccessToken' => 'https://oauth2.googleapis.com/token',
-        'urlResourceOwnerDetails' => 'https://www.googleapis.com/oauth2/v2/userinfo',
+        'urlResourceOwnerDetails' => 'https://www.googleapis.com/oauth2/v3/userinfo',
         'scopes' => 'profile https://www.googleapis.com/auth/userinfo.email',
         'auth_name' => 'Google',
         'auth_service' => 'Google',
@@ -634,19 +778,20 @@ class OktaOauth2Provider extends GenericOauth2Provider {
 
 // Authorization Email OAuth Providers
 class GenericEmailOauth2Provider extends GenericOauth2Provider {
-   function getPluginInstance($id) {
-       $i = parent::getPluginInstance($id);
+
+    function getPluginInstance($id) {
+        if (!($i=parent::getPluginInstance($id)))
+            return null;
        // Set config class for Email Authorization Providers
-       $i->setConfigClass('OAuth2EmailConfig');
+       $i->setConfigClass($this->getConfigClass());
        return $i;
     }
+
 }
 
 class OtherEmailOauth2Provider extends GenericEmailOauth2Provider {
     static $id = 'oauth2:othermail';
     static $name = 'OAuth2 - Other Provider';
-    static $defaults = [];
-    static $urlOptions = [];
 }
 
 class GoogleEmailOauth2Provider extends GenericEmailOauth2Provider {
@@ -672,13 +817,14 @@ class GoogleEmailOauth2Provider extends GenericEmailOauth2Provider {
 class MicrosoftEmailOauth2Provider extends GenericEmailOauth2Provider {
     static $id = 'oauth2:msmail';
     static $name = 'OAuth2 - Microsoft';
+    static $config_class = 'OAuth2MicrosoftEmailConfig';
     static $defaults = [
         'urlAuthorize' => 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
         'urlAccessToken' => 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-        'urlResourceOwnerDetails' => 'https://outlook.office.com/api/v2.0/me',
-        'scopes' => 'offline_access https://outlook.office.com/Mail.ReadWrite',
-        'attr_username' => 'EmailAddress',
-        'attr_email' => 'EmailAddress',
+        'urlResourceOwnerDetails' => 'https://graph.microsoft.com/v1.0/me',
+        'scopes' => 'offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/POP.AccessAsUser.All https://outlook.office.com/SMTP.Send',
+        'attr_username' => 'mail',
+        'attr_email' => 'mail',
         'attr_givenname' => 'givenname',
         'attr_surname' => 'surname',
         ];
@@ -687,5 +833,32 @@ class MicrosoftEmailOauth2Provider extends GenericEmailOauth2Provider {
         'accessType' => 'offline_access',
         'prompt' => 'select_account',
         ];
+
+    /*
+     * TEMP: To avoid breaking changes, we're intercepting
+     * addPluginInstance to populate urlResourceOwnerDetails which is
+     * removed from this nameless provider's Config form for reasons
+     * mentioned below.
+     * TODO: Update addPluginInstance in class.plugin.php to take
+     * instanciated form instead of $vars. This will allow provider to
+     * validate it's own data.
+     */
+    function addPluginInstance($vars, &$errors) {
+        // We nolonger need resource owner url but core uses default config
+        // form - so we have to add it here.
+        $vars['urlResourceOwnerDetails'] = self::$defaults['urlResourceOwnerDetails'];
+        return parent::addPluginInstance($vars,$errors);
+    }
+
+    // Nuke ability to get resource owner details - see below
+    function getResourceOwnerUrl() {
+        return null;
+    }
+
+    public function getToken($code, $owner=false) {
+        // Disable getting resource owner - to avoid cross-resource issues
+        // with outlook and graph endpoints
+        return parent::getToken($code, false);
+    }
 }
 ?>
